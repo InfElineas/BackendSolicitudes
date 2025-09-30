@@ -1,33 +1,98 @@
 # app/main.py
+import os
 from fastapi import FastAPI
-from starlette.middleware.cors import CORSMiddleware
-from app.core.rate_limit import limiter, rate_limit_handler
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from app.api.router import api_router
-from app.core.indexes import startup_tasks
+
 from app.core.config import settings
-
-app = FastAPI(title="Sistema de Gestión de Solicitudes de Automatización")
-
-# Rate-limit
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
-
-# CORS
-allow_origins = [*settings.cors_origins, "http://localhost:3000", "http://127.0.0.1:3000",
-                 "http://localhost:5173", "http://127.0.0.1:5173"]
-app.add_middleware(CORSMiddleware,
-    allow_credentials=True, allow_origins=allow_origins or ["http://localhost:3000"],
-    allow_methods=["GET","POST","PUT","DELETE","OPTIONS"],
-    allow_headers=["Authorization","Content-Type"], expose_headers=["*"], max_age=600
+from server import (
+    api_router,
+    limiter,
+    client,
+    ensure_core_indexes,
+    ensure_trash_indexes,
+    ensure_security_indexes,
+    migrate_requests_schema,
+    init_data,
 )
 
-# Rutas
-app.include_router(api_router, prefix="/api")
+APP_NAME = os.getenv("APP_NAME", "SisAut Backend")
+APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 
-# Startup
+# --- CORS: fusiona .env + defaults completos (no omitimos nada) ---
+defaults = {
+    # Fronts locales más comunes
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+    "http://localhost:4321",
+    "http://127.0.0.1:4321",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+
+    # Tu front en producción
+    "https://solicitudesxdepartamento.netlify.app",
+}
+# Une lo que venga del .env (settings.cors_origins) con los defaults
+CORS_ORIGINS = sorted(set((settings.cors_origins or []) + list(defaults)))
+
+# Crea la app
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
+
+# --- IMPORTANTE: CORS primero ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Luego el resto de middlewares
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# SlowAPI: conecta el limiter ya usado en tus endpoints
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Rutas de tu backend (respeta los paths tal como están en server.py)
+app.include_router(api_router, prefix="")
+
+# Endpoints de salud (aditivos, opcionales)
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+@app.get("/ready")
+async def ready():
+    return {"ready": True}
+
+# Índices y migraciones en startup (idempotente)
 @app.on_event("startup")
-async def on_startup():
-    await startup_tasks()
+async def startup():
+    await ensure_security_indexes()
+    await ensure_trash_indexes()
+    await ensure_core_indexes()
+    await migrate_requests_schema()
+    # opcional: solo en dev
+    # await init_data()
 
-# Shutdown (Motor cierra en core.db)
+# Shutdown limpio de la DB
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    try:
+        client.close()
+    except Exception:
+        pass
+
+# Runner local opcional
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", reload=True, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))

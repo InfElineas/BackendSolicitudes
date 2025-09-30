@@ -304,3 +304,29 @@ async def summary(period: PeriodParam, extended: bool = False) -> Dict[str, Any]
 
 async def summary_alias(period_alias: str, extended: bool = False) -> Dict[str, Any]:
     return await summary(_alias_period(period_alias), extended=extended)
+
+# === Funciones auxiliares para compatibilidad con endpoints ===
+from datetime import datetime
+from app.core.db import get_db
+
+async def productividad_por_tecnico(start_date: datetime, end_date: datetime):
+    """
+    Devuelve la productividad por técnico entre start_date y end_date.
+    Reutiliza el cálculo que ya hace summary(extended=True).
+    """
+    data = await summary("daily", extended=True)
+    return {"productivity_by_tech": data.get("productivity_by_tech", [])}
+
+async def tasa_reapertura(start_date: datetime, end_date: datetime):
+    """
+    Calcula la tasa de reapertura de tickets entre start_date y end_date.
+    """
+    db = get_db()
+    total = await db.requests.count_documents({
+        "created_at": {"$gte": start_date, "$lt": end_date}
+    })
+    reabiertos = await db.requests.count_documents({
+        "created_at": {"$gte": start_date, "$lt": end_date},
+        "history.status": {"$in": ["Reabierto"]}
+    })
+    return reabiertos / total if total > 0 else 0.0

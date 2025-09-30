@@ -1,13 +1,11 @@
 from fastapi import (
-    FastAPI, APIRouter, HTTPException, Depends,
+    APIRouter, HTTPException, Depends,
     Body, Form, Query, Request as FastAPIRequest
 )
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-import os, logging, uuid
-from pathlib import Path
+
+
+import logging, uuid
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal, Dict, Any
 from datetime import datetime, timezone, timedelta, date
@@ -15,41 +13,48 @@ import jwt
 from passlib.context import CryptContext
 from collections import defaultdict
 
+from app.core.config import settings
+from app.core.db import get_db, get_client
+
+# server.py
+from app.api.routes import config as config_routes
+
+
+
+from app.core.app_config_service import get_app_config, upsert_app_config
+from app.core.app_config_schema import AppConfig, Department as ConfigDepartment, RequestOptions
+
+
+
+
 # Rate limiting (SlowAPI)
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from slowapi import _rate_limit_exceeded_handler
-
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / ".env")
 
 # ---- MongoDB connection ----
-mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
+db = get_db()
+client = get_client()
+
 
 # ---- Security & JWT ----
-SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+SECRET_KEY = settings.secret_key
+ALGORITHM = settings.algorithm
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.access_token_expire_minutes
 
 # ---- Security params from ENV ----
-LOGIN_RATE_LIMIT = os.environ.get("LOGIN_RATE_LIMIT", "5/minute")
-LOGIN_LOCK_THRESHOLD = int(os.environ.get("LOGIN_LOCK_THRESHOLD", "8"))
-LOGIN_LOCK_WINDOW_MIN = int(os.environ.get("LOGIN_LOCK_WINDOW_MIN", "15"))
+LOGIN_RATE_LIMIT = settings.login_rate_limit
+LOGIN_LOCK_THRESHOLD = settings.login_lock_threshold
+LOGIN_LOCK_WINDOW_MIN = settings.login_lock_window_min
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
 # ---- App ----
-app = FastAPI(title="Sistema de Gestión de Solicitudes de Automatización")
 api_router = APIRouter(prefix="/api")
+api_router.include_router(config_routes.router)
 
 # ---- SlowAPI limiter ----
 limiter = Limiter(key_func=get_remote_address, enabled=True)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ============================
 #            Models
@@ -268,7 +273,7 @@ async def ensure_security_indexes():
         pass
 
 # ---- Core indexes ----
-TRASH_TTL_DAYS = 14
+TRASH_TTL_DAYS = settings.trash_ttl_days
 
 async def ensure_trash_indexes():
     try:
@@ -307,8 +312,34 @@ async def ensure_core_indexes():
     except Exception:
         pass
 
+async def ensure_app_config_seed():
+    cfg = await get_app_config(force=True)
+    if cfg.departments:
+        return  # ya hay algo
+    # semilla con tu departments_data
+    from .lo_que_sea import departments_data  # o pega el array aquí
+    depts = [Department(**d) for d in departments_data]
+    defaults = RequestOptions()  # usa defaults por ahora
+    await upsert_app_config(AppConfig(departments=depts, request_options=defaults))
+
 # ---- Migración de datos existentes ----
-async def migrate_requests_schema():
+async def migrate_requests_schema() -> None:
+    """
+    Idempotente: asegura defaults en documentos existentes.
+    IMPORTANTE: no usar 'comment', 'hint' ni kwargs no soportados para writes.
+    """
+    # 1) Asegura campo 'type' si no existe
+    await db.requests.update_many(
+        {"type": {"$exists": False}},
+        {"$set": {"type": "Soporte"}}
+    )
+
+    # 2) (Opcional) más migraciones seguras aquí, sin kwargs extra:
+    # await db.requests.update_many(
+    #     {"priority": {"$exists": False}},
+    #     {"$set": {"priority": "media"}}
+    # )
+
     # Defaults faltantes
     await db.requests.update_many({"type": {"$exists": False}}, {"$set": {"type": "Soporte"}})
     await db.requests.update_many({"channel": {"$exists": False}}, {"$set": {"channel": "Sistema"}})
@@ -318,7 +349,7 @@ async def migrate_requests_schema():
         await db.requests.update_many({"status": k}, {"$set": {"status": v}})
 
 async def record_failed_login(username: str, ip: str, window_min: int):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     await db.failed_logins.insert_one({
         "key": f"{username}|{ip}",
         "createdAt": now,
@@ -326,7 +357,7 @@ async def record_failed_login(username: str, ip: str, window_min: int):
     })
 
 async def is_locked(username: str, ip: str, threshold: int, window_min: int) -> bool:
-    since = datetime.utcnow() - timedelta(minutes=window_min)
+    since = datetime.now(timezone.utc) - timedelta(minutes=window_min)
     key = f"{username}|{ip}"
     count = await db.failed_logins.count_documents({"key": key, "createdAt": {"$gte": since}})
     return count >= threshold
@@ -341,21 +372,27 @@ async def init_data():
 
     # Departments
     departments_data = [
-    {"name": "Administración", "description": "Gestión administrativa y coordinación general"},
-    {"name": "Contabilidad y Finanzas", "description": "Gestión financiera, contabilidad y control económico"},
-    {"name": "Comercial", "description": "Estrategias y actividades comerciales"},
-    {"name": "Inventario", "description": "Control y gestión de inventarios"},
-    {"name": "Informática", "description": "Soporte tecnológico y sistemas de información"},
-    {"name": "Facturación", "description": "Gestión de facturación y cobros"},
-    {"name": "Expedición", "description": "Preparación y envío de pedidos"},
-    {"name": "Calidad", "description": "Control y aseguramiento de calidad"},
-    {"name": "Transporte y Distribución", "description": "Logística de transporte y entrega de mercancías"},
-    {"name": "Mantenimiento", "description": "Mantenimiento preventivo y correctivo de instalaciones y equipos"},
-    {"name": "Punto de Venta", "description": "Atención y gestión en el punto de venta"},
-    {"name": "Almacén", "description": "Gestión de almacenamiento y organización de mercancías"},
-    {"name": "Picker and Packer", "description": "Selección, empaquetado y preparación de productos"},
-    {"name": "Estibadores", "description": "Carga, descarga y manipulación de mercancías"}
+    {"code": "01", "name": "Administración", "description": "Direccion y gerencia de la empresa"},
+    {"code": "02", "name": "Contabilidad y Finanzas", "description": "Gestión financiera, contabilidad y control económico"},
+    {"code": "03", "name": "Asistencia Ejecutiva", "description": "Apoyo a dirección y coordinación ejecutiva"},
+    {"code": "04", "name": "Comercial", "description": "Estrategias y actividades comerciales"},
+    {"code": "05", "name": "Atención al Cliente", "description": "Atención, soporte y experiencia de cliente"},
+    {"code": "06", "name": "Facturación", "description": "Gestión de facturación y cobros"},
+    {"code": "07", "name": "Inventario", "description": "Control y gestión de inventarios"},
+    {"code": "08", "name": "Picker and Packer", "description": "Selección, empaquetado y preparación de pedidos"},
+    {"code": "09", "name": "Expedición", "description": "Preparación y envío de pedidos"},
+    {"code": "10", "name": "Estibador", "description": "Carga, descarga y manipulación de mercancías"},
+    {"code": "11", "name": "Punto de Ventas", "description": "Gestión y atención en punto de venta"},
+    {"code": "12", "name": "Calidad", "description": "Control y aseguramiento de la calidad"},
+    {"code": "13", "name": "Informática", "description": "Soporte tecnológico y sistemas de información"},
+    {"code": "14", "name": "Almacén", "description": "Gestión de almacenamiento y organización de mercancías"},
+    {"code": "15", "name": "Mantenimiento", "description": "Mantenimiento preventivo y correctivo"},
+    {"code": "16", "name": "Transporte", "description": "Logística de transporte y distribución"},
+    {"code": "17", "name": "Servicio", "description": "Servicios internos y soporte operativo"},
+    {"code": "18", "name": "Diseño", "description": "Diseño gráfico y materiales de comunicación"},
+    {"code": "19", "name": "Servicios Externos", "description": "Gestión de terceros y contratistas"},
 ]
+
     for d in departments_data:
         await db.departments.insert_one(Department(**d).dict())
 
@@ -363,18 +400,7 @@ async def init_data():
     users_data = [
         {"username": "admin", "password": "admin123", "full_name": "Administrador Sistema",
          "department": "Directivos", "position": "Jefe de departamento", "role": "admin"},
-        {"username": "soporte1", "password": "soporte123", "full_name": "Juan Pérez",
-         "department": "Directivos", "position": "Especialista", "role": "support"},
-        {"username": "soporte2", "password": "soporte123", "full_name": "María González",
-         "department": "Directivos", "position": "Especialista", "role": "support"},
-        {"username": "facturacion1", "password": "user123", "full_name": "Carlos López",
-         "department": "Facturación", "position": "Jefe de departamento", "role": "employee"},
-        {"username": "inventario1", "password": "user123", "full_name": "Ana Martínez",
-         "department": "Inventario", "position": "Especialista", "role": "employee"},
-        {"username": "comercial1", "password": "user123", "full_name": "Pedro Sánchez",
-         "department": "Comerciales", "position": "Especialista", "role": "employee"},
-        {"username": "rrhh1", "password": "user123", "full_name": "Laura Torres",
-         "department": "Recursos Humanos", "position": "Jefe de departamento", "role": "employee"},
+        
     ]
     username_to_doc: Dict[str, dict] = {}
     for u in users_data:
@@ -524,35 +550,24 @@ async def create_request(payload: RequestCreate, current_user: User = Depends(ge
     await db.requests.insert_one(new_request.dict())
     return new_request
 
-    data = payload.dict(exclude_unset=True)
-    if not data.get("requested_at"):
-        data["requested_at"] = datetime.now(timezone.utc)
-    new_request = Request(
-        **data,
-        requester_id=current_user.id,
-        requester_name=current_user.full_name,
-        department=current_user.department,
-    )
-    new_request.state_history.append(StateEvent(
-        from_status=None, to_status=new_request.status,
-        by_user_id=current_user.id, by_user_name=current_user.full_name
-    ))
-    await db.requests.insert_one(new_request.dict())
-    # Registrar evento normalizado
-    await db.ticket_status_events.insert_one({
-        "id": str(uuid.uuid4()),
-        "ticket_id": new_request.id,
-        "estado": new_request.status,
-        "changed_by": current_user.id,
-        "changed_at": datetime.now(timezone.utc),
-    })
-    return new_request
+# Detalle de una solicitud (aditivo; no rompe endpoints existentes)
+@api_router.get("/requests/{request_id}", response_model=Request)
+async def get_request_detail(
+    request_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    doc = await db.requests.find_one({"id": request_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Request not found")
+    # Normaliza timestamps a datetime si hiciera falta; si ya están OK, puedes devolver directo
+    return Request(**doc)
+
 
 @api_router.get("/requests", response_model=PaginatedRequests)
 async def get_requests(
     current_user: User = Depends(get_current_user),
     page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=int(os.environ.get("MAX_PAGE_SIZE", "50"))),
+    page_size: int = Query(10, ge=1, le=settings.max_page_size),
     status: Optional[RequestStatus] = Query(None),
     department: Optional[str] = Query(None),
     q: Optional[str] = Query(None, description="Texto en título/descripción"),
@@ -754,53 +769,6 @@ async def transition_request(
     doc = await db.requests.find_one({"id": request_id})
     return _to_request(doc)
 
-    request_id: str
-    payload: TransitionPayload
-    current_user: User = Depends(require_role(["support", "admin"]))
-    doc = await db.requests.find_one({"id": request_id})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Request not found")
-
-    current = _to_request(doc)
-    ensure_transition(current.status, payload.to_status)
-
-    now = datetime.now(timezone.utc)
-    set_ops: Dict[str, Any] = {
-        "status": payload.to_status,
-        "updated_at": now,
-    }
-    if payload.to_status in {"Finalizada", "Rechazada"}:
-        set_ops["completion_date"] = now
-
-    history_event = StateEvent(
-        from_status=current.status,
-        to_status=payload.to_status,
-        by_user_id=current_user.id,
-        by_user_name=current_user.full_name,
-    ).dict()
-
-    # retrabajo: si vuelve a un estado abierto desde Finalizada
-    inc_ops = {}
-    if current.status == "Finalizada" and payload.to_status in OPEN_STATES:
-        inc_ops = {"$inc": {"reabierto_count": 1}}
-
-    ops = {"$set": set_ops, "$push": {"state_history": history_event}}
-    if inc_ops: ops.update(inc_ops)
-
-    await db.requests.update_one({"id": request_id}, ops)
-
-    # evento normalizado
-    await db.ticket_status_events.insert_one({
-        "id": str(uuid.uuid4()),
-        "ticket_id": request_id,
-        "estado": payload.to_status,
-        "changed_by": current_user.id,
-        "changed_at": now,
-    })
-
-    doc = await db.requests.find_one({"id": request_id})
-    return _to_request(doc)
-
 @api_router.post("/requests/{request_id}/feedback", response_model=Request)
 async def submit_feedback(
     request_id: str,
@@ -829,7 +797,6 @@ async def submit_feedback(
     await db.requests.update_one({"id": request_id}, {"$set": {"feedback": fb}})
     doc = await db.requests.find_one({"id": request_id})
     return _to_request(doc)
-
 # ---- Update genérico con trazabilidad (compat) ----
 @api_router.put("/requests/{request_id}", response_model=Request)
 async def update_request_generic(
@@ -837,47 +804,76 @@ async def update_request_generic(
     request_update: RequestUpdate,
     current_user: User = Depends(require_role(["support", "admin"]))
 ):
-    doc = await db.requests.find_one({"id": request_id})
+    # 1) Resolución de identificador: soporta id (UUID/string) y _id (ObjectId)
+    filter_: Dict[str, Any] = {"id": request_id}
+    try:
+        from bson import ObjectId
+        if ObjectId.is_valid(request_id):
+            filter_ = {"$or": [{"id": request_id}, {"_id": ObjectId(request_id)}]}
+    except Exception:
+        pass
+
+    # 2) Documento actual (para trazabilidad y validaciones)
+    doc = await db.requests.find_one(filter_)
     if not doc:
         raise HTTPException(status_code=404, detail="Request not found")
 
     current = _to_request(doc)
+
+    # 3) Datos a actualizar (solo campos provistos)
     update_data = request_update.dict(exclude_unset=True)
     now = datetime.now(timezone.utc)
     update_data["updated_at"] = now
 
     ops: Dict[str, Any] = {"$set": update_data}
+
+    # 3.1) Cambio de estado → validar transición + historizar + métricas
     if "status" in update_data and update_data["status"] and update_data["status"] != current.status:
         ensure_transition(current.status, update_data["status"])
+
+        # fecha de completado si corresponde
         if update_data["status"] in {"Finalizada", "Rechazada"}:
             ops["$set"]["completion_date"] = now
-        # push history
-        ops["$push"] = {"state_history": StateEvent(
+
+        # historial de estado
+        state_event = StateEvent(
             from_status=current.status,
             to_status=update_data["status"],
             by_user_id=current_user.id,
             by_user_name=current_user.full_name
-        ).dict()}
-        # retrabajo
+        ).dict()
+        ops["$push"] = {"state_history": state_event}
+
+        # re-trabajo (reabierto)
         if current.status == "Finalizada" and update_data["status"] in OPEN_STATES:
             ops.setdefault("$inc", {})["reabierto_count"] = 1
-        # evento normalizado
+
+        # evento normalizado (audit)
         await db.ticket_status_events.insert_one({
             "id": str(uuid.uuid4()),
-            "ticket_id": request_id,
+            "ticket_id": current.id,   # usa el id lógico del ticket
             "estado": update_data["status"],
             "changed_by": current_user.id,
             "changed_at": now,
         })
 
+    # 3.2) Si viene assigned_to, completar el nombre asignado
     if "assigned_to" in update_data and update_data["assigned_to"]:
         assigned_user = await db.users.find_one({"id": update_data["assigned_to"]})
         if assigned_user:
-            ops["$set"]["assigned_to_name"] = assigned_user["full_name"]
+            ops["$set"]["assigned_to_name"] = assigned_user.get("full_name") or assigned_user.get("name")
 
-    await db.requests.update_one({"id": request_id}, ops)
-    doc = await db.requests.find_one({"id": request_id})
-    return _to_request(doc)
+    # 4) Ejecutar update y verificar que haya aplicado
+    result = await db.requests.update_one(filter_, ops)
+    if result.matched_count == 0:
+        # No matcheó con id/_id → 404 consistente
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    # 5) Devolver el documento ya actualizado
+    #    (preferimos leer por id lógico; si no está, caemos a _id)
+    updated = await db.requests.find_one({"id": current.id}) or await db.requests.find_one(filter_)
+    return _to_request(updated)
+
 
 # ---- Worklogs ----
 @api_router.post("/requests/{request_id}/worklogs")
@@ -949,7 +945,7 @@ class PaginatedTrash(BaseModel):
 async def list_trash(
     current_user: User = Depends(require_role(["admin"])),
     page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=int(os.environ.get("MAX_PAGE_SIZE", "50"))),
+    page_size: int = Query(10, ge=1, le=settings.max_page_size),
     q: Optional[str] = Query(None),
 ):
     filt: Dict[str, Any] = {}
@@ -1346,31 +1342,9 @@ async def analytics_dashboard(
 # ============================
 #        App lifecycle
 # ============================
-@app.on_event("startup")
-async def startup_event():
-    await ensure_security_indexes()
-    await ensure_core_indexes()
-    await ensure_trash_indexes()
-    await migrate_requests_schema()  # corrige datos existentes
-    await init_data()
-
-app.include_router(api_router)
 
 # ---- CORS (robusto para dev) ----
-allow_origins_list = list(filter(None, [
-    *(o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()),
-    "http://localhost:3000", "http://127.0.0.1:3000",
-    "http://localhost:5173", "http://127.0.0.1:5173",
-]))
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=allow_origins_list or ["http://localhost:3000"],
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-    expose_headers=["*"],
-    max_age=600,
-)
+
 
 # ---- Logging ----
 logging.basicConfig(
@@ -1378,11 +1352,3 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=True)

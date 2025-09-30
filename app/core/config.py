@@ -1,27 +1,73 @@
 # app/core/config.py
-import os
-from pydantic import BaseSettings, AnyUrl
-from typing import List
+from typing import List, Union
+from pydantic import BaseSettings, validator
+import json
+
 
 class Settings(BaseSettings):
-    mongo_url: AnyUrl = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
-    db_name: str = os.environ.get("DB_NAME", "appdb")
-    secret_key: str = os.environ.get("SECRET_KEY", "change-me")
+    # === MongoDB ===
+    mongo_url: str = "mongodb://localhost:27017"
+    db_name: str = "appdb"
+
+    # === Seguridad / JWT ===
+    secret_key: str = "change-me"
     algorithm: str = "HS256"
-    access_token_expire_minutes: int = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+    access_token_expire_minutes: int = 30
 
-    # seguridad login
-    login_rate_limit: str = os.environ.get("LOGIN_RATE_LIMIT", "5/minute")
-    login_lock_threshold: int = int(os.environ.get("LOGIN_LOCK_THRESHOLD", "8"))
-    login_lock_window_min: int = int(os.environ.get("LOGIN_LOCK_WINDOW_MIN", "15"))
+    # === Seguridad login (anti brute-force) ===
+    login_rate_limit: str = "5/minute"
+    login_lock_threshold: int = 8
+    login_lock_window_min: int = 15
 
-    # CORS
-    cors_origins: List[str] = [o.strip() for o in os.environ.get("CORS_ORIGINS","").split(",") if o.strip()]
+    # === CORS ===
+    # Acepta JSON (["http://a","https://b"]) o lista separada por comas ("http://a,https://b")
+    cors_origins: Union[str, List[str]] = ""
 
-    # Paginación
-    max_page_size: int = int(os.environ.get("MAX_PAGE_SIZE", "50"))
+    # === Paginación ===
+    max_page_size: int = 50
 
-    # Papelera
+    # === Papelera ===
     trash_ttl_days: int = 14
 
+    @validator("cors_origins", pre=True)
+    def _parse_cors_origins(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            if s.startswith("["):
+                try:
+                    data = json.loads(s)
+                    if isinstance(data, list):
+                        return [str(x).strip() for x in data if str(x).strip()]
+                except Exception:
+                    # si parece JSON pero está mal formado, caemos al split por comas
+                    pass
+            return [item.strip() for item in s.split(",") if item.strip()]
+        return [str(v).strip()] if str(v).strip() else []
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        # Mapeo explícito a variables de entorno en mayúsculas
+        fields = {
+            "mongo_url": {"env": "MONGO_URL"},
+            "db_name": {"env": "DB_NAME"},
+            "secret_key": {"env": "SECRET_KEY"},
+            "algorithm": {"env": "ALGORITHM"},
+            "access_token_expire_minutes": {"env": "ACCESS_TOKEN_EXPIRE_MINUTES"},
+            "login_rate_limit": {"env": "LOGIN_RATE_LIMIT"},
+            "login_lock_threshold": {"env": "LOGIN_LOCK_THRESHOLD"},
+            "login_lock_window_min": {"env": "LOGIN_LOCK_WINDOW_MIN"},
+            "cors_origins": {"env": "CORS_ORIGINS"},
+            "max_page_size": {"env": "MAX_PAGE_SIZE"},
+            "trash_ttl_days": {"env": "TRASH_TTL_DAYS"},
+        }
+
+
+# Instancia global usada por server.py y main.py
 settings = Settings()

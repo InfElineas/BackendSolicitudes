@@ -10,7 +10,7 @@ router = APIRouter()
 
 @router.post("/{ticket_id}/worklogs")
 async def add_worklog(
-    ticket_id: string,
+    ticket_id: str,
     payload: dict = Body(...),
     current=Depends(require_role(["support","admin"])),
 ):

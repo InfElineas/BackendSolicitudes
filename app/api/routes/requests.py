@@ -6,43 +6,62 @@ from app.api.deps import get_current_user, require_role
 from app.core.db import get_db
 from app.core.config import settings
 from app.services.request_service import ensure_transition, normalize, assign as svc_assign, classify as svc_classify
+from app.utils.mongo_helpers import fix_mongo_id
 
 router = APIRouter()
 
 @router.post("")
 async def create_request(payload: dict, current=Depends(get_current_user)):
     db = get_db()
-    data = {k:v for k,v in (payload or {}).items() if v is not None}
+    data = {k: v for k, v in (payload or {}).items() if v is not None}
     data.setdefault("requested_at", datetime.now(timezone.utc))
 
     new_req = {
         "id": __import__("uuid").uuid4().hex,
-        "title": data["title"], "description": data["description"],
-        "priority": data["priority"], "type": data["type"],
-        "channel": data.get("channel","Sistema"),
-        "requester_id": current["id"], "requester_name": current["full_name"],
-        "department": current["department"], "requested_at": data["requested_at"],
-        "status":"Pendiente","created_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc),
+        "title": data["title"],
+        "description": data["description"],
+        "priority": data["priority"],
+        "type": data["type"],
+        "channel": data.get("channel", "Sistema"),
+        "requester_id": current["id"],
+        "requester_name": current["full_name"],
+        "department": current["department"],
+        "requested_at": data["requested_at"],
+        "status": "Pendiente",
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
         "state_history": [{
-          "from_status": None, "to_status":"Pendiente",
-          "at": datetime.now(timezone.utc), "by_user_id": current["id"], "by_user_name": current["full_name"]
+            "from_status": None,
+            "to_status": "Pendiente",
+            "at": datetime.now(timezone.utc),
+            "by_user_id": current["id"],
+            "by_user_name": current["full_name"]
         }],
         "reabierto_count": 0
     }
-    if current["role"]=="admin":
-        for k in ("level","estimated_hours","estimated_due"):
-            if k in data: new_req[k]=data[k]
+
+    if current["role"] == "admin":
+        for k in ("level", "estimated_hours", "estimated_due"):
+            if k in data:
+                new_req[k] = data[k]
         if data.get("assigned_to"):
             u = await db.users.find_one({"id": data["assigned_to"]})
-            if not u: raise HTTPException(400, "Usuario asignado no existe")
-            new_req["assigned_to"]=u["id"]; new_req["assigned_to_name"]=u["full_name"]
+            if not u:
+                raise HTTPException(400, "Usuario asignado no existe")
+            new_req["assigned_to"] = u["id"]
+            new_req["assigned_to_name"] = u["full_name"]
 
     await db.requests.insert_one(new_req)
+
     await db.ticket_status_events.insert_one({
-        "id": __import__("uuid").uuid4().hex, "ticket_id": new_req["id"], "estado":"Pendiente",
-        "changed_by": current["id"], "changed_at": datetime.now(timezone.utc)
+        "id": __import__("uuid").uuid4().hex,
+        "ticket_id": new_req["id"],
+        "estado": "Pendiente",
+        "changed_by": current["id"],
+        "changed_at": datetime.now(timezone.utc)
     })
-    return new_req
+
+    return fix_mongo_id(new_req)  # 👈 aquí convertimos bien el _id si existe
 
 @router.get("")
 async def get_requests(
