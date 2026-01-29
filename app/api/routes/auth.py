@@ -39,10 +39,14 @@ async def login(
         raise HTTPException(401, "Incorrect username or password")
 
     token = create_access_token(sub=user_doc["username"])
-    return {"access_token": token, "token_type": "bearer"}
+    safe_user = fix_mongo_id(user_doc)
+    safe_user.pop("password_hash", None)
+    return {"access_token": token, "token_type": "bearer", "user": safe_user}
 
 @router.get("/me")
 async def me(current_user=Depends(get_current_user)):
     # devuelve el usuario (compat)
-    return fix_mongo_id(current_user)
-
+    safe_user = fix_mongo_id(current_user)
+    if isinstance(safe_user, dict):
+        safe_user.pop("password_hash", None)
+    return safe_user
