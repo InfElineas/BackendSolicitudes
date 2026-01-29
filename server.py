@@ -704,13 +704,13 @@ async def update_my_profile(
     )
 
     updated = await db.users.find_one({"id": current_user.id})
-    return User(**updated)
+    return User(**normalize_user_doc(updated))
 
 
 @api_router.get("/users", response_model=List[User])
 async def get_users(current_user: User = Depends(get_current_user)):
     users = await db.users.find().to_list(1000)
-    return [User(**user) for user in users]
+    return [User(**normalize_user_doc(user)) for user in users]
 
 @api_router.patch("/users/{user_id}", response_model=User)
 async def update_user(
@@ -731,7 +731,7 @@ async def update_user(
             update_data["password_hash"] = get_password_hash(pw)
 
     if not update_data:
-        return User(**user_doc)
+        return User(**normalize_user_doc(user_doc))
 
     # evitar username duplicado (si se cambia)
     if "username" in update_data:
@@ -746,7 +746,7 @@ async def update_user(
 
     await db.users.update_one({"id": user_id}, {"$set": update_data})
     updated = await db.users.find_one({"id": user_id})
-    return User(**updated)
+    return User(**normalize_user_doc(updated))
 
 
 # ---- Departments ----
