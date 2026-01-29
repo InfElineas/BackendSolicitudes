@@ -71,8 +71,8 @@ class User(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     username: str
     full_name: str
-    department: str
-    position: str  # "Jefe de departamento" | "Especialista"
+    department: Optional[str] = None
+    position: Optional[str] = None  # "Jefe de departamento" | "Especialista"
     role: str      # "admin" | "support" | "employee"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -211,6 +211,30 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+def normalize_user_doc(user: dict) -> dict:
+    normalized = dict(user)
+    department = normalized.get("department")
+    if isinstance(department, dict):
+        normalized["department"] = (
+            department.get("name")
+            or department.get("label")
+            or str(department)
+        )
+    elif department is not None and not isinstance(department, str):
+        normalized["department"] = str(department)
+
+    position = normalized.get("position")
+    if isinstance(position, dict):
+        normalized["position"] = (
+            position.get("name")
+            or position.get("label")
+            or str(position)
+        )
+    elif position is not None and not isinstance(position, str):
+        normalized["position"] = str(position)
+
+    return normalized
+
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
@@ -223,7 +247,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     user = await db.users.find_one({"username": username})
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
-    return User(**user)
+    return User(**normalize_user_doc(user))
 
 def require_role(required_roles: List[str]):
     async def role_checker(current_user: User = Depends(get_current_user)):
